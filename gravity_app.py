@@ -401,8 +401,12 @@ class GravityApp:
             elif event.key == pygame.K_F1:
                 self.show_hud = not self.show_hud
             elif event.key == pygame.K_v and self.renderer:
-                modes = ("cinematic", "density", "hybrid")
+                modes = ("cinematic", "density", "hybrid", "plasma", "molten", "wisps")
                 self.renderer.mode = modes[(modes.index(self.renderer.mode)+1)%len(modes)]
+            elif event.key == pygame.K_p and self.renderer:
+                modes = ("plasma", "molten", "wisps")
+                current = self.renderer.mode
+                self.renderer.mode = modes[(modes.index(current)+1)%3] if current in modes else modes[0]
             elif event.key == pygame.K_j and self.renderer:
                 self.renderer.jelly = not self.renderer.jelly
             elif event.key == pygame.K_k and self.renderer:
@@ -751,14 +755,14 @@ class GravityApp:
             text(f"FRAME / {self.reference_body.name}", (30,146), LOCK_COLOR)
         elif self.reference_pick_armed:
             text("Click a particle to follow it", (30,146), LOCK_COLOR)
-        text("TAB help   F1 clean view   V view   J jelly   K size   T trails   SPACE pause", (24,h-52))
+        text("TAB help   F1 clean view   V view   P plasma   J jelly   K size   T trails   SPACE pause", (24,h-52))
         text(self.diagnostic_text, (24,h-29), (113,135,165))
         if self.show_help:
             lines=[
                 "CONTROLS",
                 "+/- speed | PgUp/PgDn timestep | 0 reset timestep",
                 "S/B solver | U enable CUDA | G glow | T trails",
-                "V cinematic/density/hybrid | comma/period exposure",
+                "V all views | P plasma/molten/wisps | ,/. exposure",
                 "J jelly stars | K star size | N nebula haze | L flares",
                 "A pause + sample force errors",
                 "Wheel zoom | middle-drag pan | F follow particle",

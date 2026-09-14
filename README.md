@@ -350,3 +350,15 @@ This quick visual update received a Python syntax check only; GPU visual and
 performance verification is deferred to interactive use.
 
 The spatial-tree display and H shortcut have been removed; internal solver trees remain.
+
+### Experimental plasma presets
+
+Press **P** to jump into and cycle three new OpenGL looks: **plasma** (broad
+red/orange gas envelopes with cream-hot cores), **molten** (violet/cyan jelly
+clouds with pearly isosurface rims), and **wisps** (purple/turquoise filaments).
+**V** cycles all six views. The existing galaxy particles drive overlapping
+Gaussian envelopes, proportional to exp(-4 r²), with 1.8× wider splats. These
+are rendering presets, not a hydrodynamics or temperature simulation. Filament
+texture is world-anchored; it does not keep animating when physics is paused.
+Bloom, exposure, haze, and flares remain available. Experimental: no tests run
+for this update, per request. Wider splats cost additional pixel overdraw.

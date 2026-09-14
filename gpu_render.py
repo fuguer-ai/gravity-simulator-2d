@@ -98,6 +98,7 @@ uniform float bloom_strength;
 uniform int density;
 uniform int galaxy;
 uniform int hybrid;
+uniform int plasma;
 uniform int mist;
 uniform int flares;
 uniform vec2 viewport;
@@ -130,6 +131,34 @@ void main(){
         float heat=clamp(log(1.+d*exposure*.35)/3.6,0.,1.);
         // Same log palette as density mode, combined in HDR before tone mapping.
         radiance+=palette(heat)*smoothstep(0.,.12,heat)*(.16+heat*1.1);
+    }
+    if(plasma>0){
+        // Broad Gaussian splats exp(-4 r²): overlapping gas envelopes.
+        // Compensate for the 1.8x splat radius; this is artistic emission.
+        float gas=d/3.24;
+        float heat=clamp(log(1.+gas*.45)/3.,0.,1.);
+        float opacity=1.-exp(-gas*.10);
+        vec3 emission;
+        if(plasma==1){
+            // Hot hydrogen: crimson envelopes, orange bodies, cream cores.
+            emission=mix(vec3(.65,.018,.055),vec3(1.5,.35,.025),smoothstep(.05,.55,heat));
+            emission=mix(emission,vec3(2.,1.6,.85),smoothstep(.5,1.,heat));
+            radiance=radiance*.08+emission*opacity*(.35+heat);
+        } else if(plasma==2){
+            // Liquid-like overlapping isosurfaces, softly lit pearly rims.
+            float shell=pow(.5+.5*cos(heat*30.),10.)*smoothstep(.08,.3,heat);
+            emission=mix(vec3(.06,.12,.5),vec3(.8,.16,.65),heat);
+            radiance=radiance*.22+emission*opacity*(.4+heat)
+                     +vec3(.25,.65,.85)*shell*opacity*.55;
+        } else {
+            // World-anchored, domain-warped filaments: no animation while paused.
+            vec2 p=world*.012;
+            float fold=sin(p.x+2.*sin(p.y*.7))+sin(p.y*1.3+sin(p.x*.6));
+            float filament=pow(.5+.5*sin(p.x*2.7-p.y+fold*2.),3.);
+            emission=mix(vec3(.18,.025,.45),vec3(.04,.8,.9),filament);
+            radiance=radiance*.10+emission*opacity*(.25+heat)*( .45+filament)
+                     +vec3(.85,.45,.8)*pow(heat,3.)*.35;
+        }
     }
     if(mist==1){
         vec2 offset=vec2(16.)/viewport;
@@ -274,7 +303,7 @@ class GalaxyRenderer:
             self.stars['zoom']=zoom
             self.stars['density']=int(self.mode=='density')
             self.stars['glow']=int(glow)
-            self.stars['jelly']=int(self.jelly)
+            self.stars['jelly']=int(self.jelly or self.mode=='molten')
             self.stars['star_scale']=self.star_scale
             self.stars['splat_radius']=min(45.,max(10.,math.sqrt(size[0]*size[1]/len(bodies))*1.7))
             self.vao.render(vertices=6,instances=len(bodies))
@@ -282,7 +311,7 @@ class GalaxyRenderer:
                 self.density_field[1].use()
                 self.density_field[1].clear()
                 self.stars['density']=1
-                self.stars['splat_radius']=min(55.,max(20.,math.sqrt(size[0]*size[1]/len(bodies))*2.5))
+                self.stars['splat_radius']=min(55.,max(20.,math.sqrt(size[0]*size[1]/len(bodies))*2.5))*(1.8 if self.mode in ('plasma','molten','wisps') else 1.)
                 self.vao.render(vertices=6,instances=len(bodies))
         if not len(bodies):
             self.density_field[1].clear()
@@ -325,6 +354,7 @@ class GalaxyRenderer:
         for name,value in dict(scene=0,bloom=1,overlay=2,density_tex=3,exposure=self.exposure,
                                bloom_strength=.8 if glow else 0.,density=int(self.mode=='density'),
                                galaxy=int(galaxy and glow),hybrid=int(self.mode=='hybrid'),
+                               plasma={'plasma':1,'molten':2,'wisps':3}.get(self.mode,0),
                                mist=int(self.mist),flares=int(self.flares),viewport=size,origin=origin,zoom=zoom).items():
             self.composite[name]=value
         self.full[self.composite].render()
