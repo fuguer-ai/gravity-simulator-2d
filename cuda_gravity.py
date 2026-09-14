@@ -104,6 +104,8 @@ class DeviceState:
         self.background = wp.array(np.asarray(components, dtype=np.float32).reshape(-1, 2),
                                    dtype=wp.vec2, device=self.device)
         self.background_count = len(components)
+        self._graphs = {}
+        self._graph_dt = None
         self.upload(bodies)
 
     def upload(self, bodies):
@@ -131,7 +133,7 @@ class DeviceState:
             if self.background_count:
                 wp.launch(add_background, dim=self.n,
                           inputs=[self.pos, self.acc, self.background, self.background_count, self.G],
-                          device=self.device)
+                          device=self.device, block_dim=TILE)
         self.acc_valid = True
         return self.acc
 
@@ -142,9 +144,43 @@ class DeviceState:
             return
         if not self.acc_valid:
             self.force()
-        wp.launch(drift, dim=self.n, inputs=[self.pos, self.vel, self.acc, dt], device=self.device)
+        wp.launch(drift, dim=self.n, inputs=[self.pos, self.vel, self.acc, dt], device=self.device, block_dim=TILE)
         self.force()
-        wp.launch(kick, dim=self.n, inputs=[self.vel, self.acc, dt], device=self.device)
+        wp.launch(kick, dim=self.n, inputs=[self.vel, self.acc, dt], device=self.device, block_dim=TILE)
+
+    def step_batch(self, dt, count, *, use_graphs=True):
+        """Enqueue a bounded batch; caller synchronizes once at its boundary.
+
+        Arrays remain authoritative on device. Graphs capture no uploads or
+        downloads. A timestep change invalidates graph arguments, not forces.
+        """
+        if not math.isfinite(dt) or dt <= 0 or not isinstance(count, int) or not 0 <= count <= 32:
+            raise ValueError("Positive finite dt and integer batch size 0..32 required")
+        if not count or not self.n:
+            return
+        if not self.acc_valid:
+            self.force()
+        if not self.device.is_cuda or not use_graphs:
+            for _ in range(count):
+                self.step(dt)
+            return
+        if dt != self._graph_dt:
+            self._graphs.clear()
+            self._graph_dt = dt
+        if count not in self._graphs:
+            # Compile before capture; kernels share a fixed launch block size.
+            wp.load_module(module=__name__, device=self.device, block_dim=TILE)
+            with wp.ScopedCapture(device=self.device) as capture:
+                for _ in range(count):
+                    self.step(dt)
+            if len(self._graphs) >= 8:
+                self._graphs.clear()
+            self._graphs[count] = capture.graph
+        wp.capture_launch(self._graphs[count])
+
+    def snapshot(self):
+        """Detached host arrays; consumers never share mutable device storage."""
+        return self.pos.numpy()[:self.n].copy(), self.vel.numpy()[:self.n].copy()
 
     def synchronize(self):
         wp.synchronize_device(self.device)
@@ -193,4 +229,11 @@ def verify_device(device="cuda:0"):
     if not (np.allclose(state.pos.numpy()[:65], expected_pos, rtol=5e-5, atol=5e-5)
             and np.allclose(state.vel.numpy()[:65], expected_vel, rtol=5e-5, atol=5e-5)):
         raise RuntimeError("CUDA integration startup check failed")
+    # Exercise graph capture, replay and dt invalidation on actual CUDA devices.
+    for dt, count in ((.001, 4), (.001, 4), (.002, 2)):
+        state.step_batch(dt, count)
+        for _ in range(count):
+            ref.step(dt)
+        if not np.allclose(state.pos.numpy()[:65], [(b.x,b.y) for b in bodies], rtol=5e-5, atol=5e-5):
+            raise RuntimeError("CUDA batch/graph startup check failed")
     return state.device.name
