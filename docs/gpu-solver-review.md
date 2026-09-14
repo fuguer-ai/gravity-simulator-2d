@@ -89,3 +89,12 @@ asymptotic exponent alone does not establish a win at a few thousand bodies.
   CPU timing is not offered as a prediction of NVIDIA performance.
 - Windows batch execution and real GPU runtime checks remain machine-dependent;
   the CUDA launcher performs force and integration checks on the user's GPU.
+
+## Subsequent Observatory update
+
+The default GPU integration now persists across frames and executes bounded
+CUDA graph batches; it no longer uploads bodies every frame or synchronizes after
+each individual step. The renderer now uses OpenGL by default when available.
+See [current implementation](observatory-implementation.md) for automatic GPU
+population calibration, coordinated pacing, validation and the optional worker.
+The earlier figures and description above document the first integration.

@@ -17,3 +17,8 @@ Keyframe41/Videos was reviewed as an educational reference. No animation code or
 assets were copied. The hierarchy and sampled error visualizations are original
 additions inspired by the concepts illustrated in that video. Other reviewed
 projects are recorded in `docs/gpu-solver-review.md`; none were vendored.
+
+The Observatory renderer (`gpu_render.py`), frame controller, worker, automatic
+population calibration, and UI are original additions. ModernGL 5.12.0 and
+glcontext 3.0.0 are separately installed optional dependencies. No external
+textures, fonts, animation code or image assets are bundled by this update.

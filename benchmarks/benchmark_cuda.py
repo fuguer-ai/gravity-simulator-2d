@@ -60,9 +60,30 @@ def main():
         state.step(.5)
         step_ms = timed(lambda: state.step(.5), state.synchronize, args.repeats)
         transfer_ms = timed(lambda: state.download(bs), state.synchronize, args.repeats)
+        # Compare the old frame pattern (upload + per-step barriers + download)
+        # with resident graph batches at identical N, dt and eight steps/frame.
+        def old_frame():
+            state.upload(bs)
+            for _ in range(8):
+                state.step(.5)
+                state.synchronize()
+            state.download(bs)
+        old_frame()
+        old_frame_ms=timed(old_frame,state.synchronize,args.repeats)
+        state.step_batch(.5,8)
+        state.synchronize()
+        def graph_frame():
+            state.step_batch(.5,8)
+            state.synchronize()
+            state.download(bs)
+        graph_frame_ms=timed(graph_frame,state.synchronize,args.repeats)
+        batch_ms=timed(lambda:state.step_batch(.5,8),state.synchronize,args.repeats)
         row = dict(n=n, force_ms=force_ms, resident_step_ms=step_ms,
                    download_ms=transfer_ms, sampled_force_relative_rms=rms,
-                   state_bytes=state.size*7*4)
+                   state_bytes=state.size*7*4, batch8_ms=batch_ms,
+                   batch_step_ms=batch_ms/8, old_frame8_ms=old_frame_ms,
+                   coordinated_frame8_ms=graph_frame_ms,
+                   measured_frame_speedup=old_frame_ms/graph_frame_ms)
         if args.compare_cpu:
             # Use original seeded state for an apples-to-apples force comparison.
             initial = spiral_galaxy(star_count=n)

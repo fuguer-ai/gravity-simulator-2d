@@ -9,13 +9,14 @@ from collections import deque
 from dataclasses import dataclass
 
 import pygame
+import numpy as np
 
 from galaxy_render import GalaxyLighting
 from simulation_clock import FixedStepClock
 from gravity_sim import Body, NBodySimulation
 from galaxy import spiral_galaxy, BACKGROUND as GALAXY_BACKGROUND, SOFTENING as GALAXY_SOFTENING
 
-WIDTH, HEIGHT = 1100, 720
+WIDTH, HEIGHT = 1440, 900
 BACKGROUND = (10, 13, 22)
 GRID = (26, 31, 44)
 TEXT = (225, 230, 240)
@@ -156,14 +157,42 @@ def scenario_bodies(key: str, galaxy_particles: int = 1200) -> tuple[list[Body],
 
 
 class GravityApp:
-    def __init__(self, solver="fmm", galaxy_particles=1200) -> None:
+    def __init__(self, solver="fmm", galaxy_particles=1200, *, renderer="auto", threaded=False, use_graphs=True) -> None:
         pygame.init()
         pygame.display.set_caption("2D Gravity Simulator")
-        self.screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
+        self.renderer = None
+        if renderer != "software":
+            try:
+                from gpu_render import GalaxyRenderer
+                pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
+                pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
+                pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE)
+                pygame.display.set_mode((WIDTH, HEIGHT), pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE)
+                self.renderer = GalaxyRenderer()
+            except Exception as exc:
+                if renderer == "opengl":
+                    raise RuntimeError(f"OpenGL renderer could not start: {exc}") from exc
+                print(f"Using software renderer: {exc}")
+        if self.renderer is None:
+            self.screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
+        else:
+            self.screen = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        self.threaded = threaded
+        self.use_graphs = use_graphs
+        self._worker = None
+        self._frame_controller = None
+        self._snapshot_seq = -1
+        self.render_positions = None
+        self._render_token = 0
+        self.worker_stats = None
+        self.show_help = False
+        self.show_hud = True
+        self._menu_preview = None
+        self.gpu_profile = None
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("consolas", 18)
         self.small_font = pygame.font.SysFont("consolas", 15)
-        self.big_font = pygame.font.SysFont("consolas", 34, bold=True)
+        self.big_font = pygame.font.SysFont("segoeui", 46)
         self.title_font = pygame.font.SysFont("consolas", 23, bold=True)
 
         self.galaxy_particles = galaxy_particles
@@ -218,14 +247,17 @@ class GravityApp:
         return body.x, body.y
 
     def clear_reference(self) -> None:
+        if self.renderer:
+            self.renderer.reset_history()
         self.reference_body = None
         self.reference_pick_armed = False
         self.camera_x = 0.0
         self.camera_y = 0.0
 
     def load_scenario(self, key: str) -> None:
+        self.stop_worker()
         bodies, softening, zoom = scenario_bodies(key, self.galaxy_particles)
-        self.physics_clock = FixedStepClock(timestep=.5 if key == "galaxy" else .045)
+        self.physics_clock = FixedStepClock(timestep=.5 if key == "galaxy" else .045, budget_seconds=.008)
         self.current_scenario = key
         cuda_enabled = self.sim.cuda_enabled
         self.sim = NBodySimulation(bodies, softening=softening, solver=self.sim.solver,
@@ -239,11 +271,15 @@ class GravityApp:
         self.show_trails = key != "galaxy"
         self.time_scale = 1.0
         self.effective_time_scale = 1.0
-        self.zoom = zoom
+        self.zoom = min(self.screen.get_width(), self.screen.get_height())*.40/850 if key == "galaxy" else zoom
         self.camera_x = self.camera_y = 0.0
         self.reference_body = None
         self.reference_pick_armed = False
         self.paused = False
+        self.render_positions = None
+        self.worker_stats = None
+        if self.renderer:
+            self.renderer.reset_history()
         self.mode = "simulation"
 
     def reset(self) -> None:
@@ -279,6 +315,8 @@ class GravityApp:
     def choose_reference_body(self, pos: tuple[int, int]) -> None:
         body = self.nearest_body_on_screen(pos)
         if body is not None:
+            if self.renderer:
+                self.renderer.reset_history()
             self.reference_body = body
             self.reference_pick_armed = False
             self.camera_x = 0.0
@@ -289,6 +327,8 @@ class GravityApp:
         return PALETTE[self.spawn_color_index]
 
     def add_body(self, pos: tuple[int, int]) -> None:
+        self.stop_worker()
+        self.render_positions = None
         x, y = self.screen_to_world(*pos)
         angle = random.random() * math.tau
         speed = random.uniform(0.15, 1.0)
@@ -312,6 +352,8 @@ class GravityApp:
         self.diagnostic_points = []
 
     def remove_nearest(self, pos: tuple[int, int]) -> None:
+        self.stop_worker()
+        self.render_positions = None
         if not self.sim.bodies:
             return
         x, y = self.screen_to_world(*pos)
@@ -353,7 +395,18 @@ class GravityApp:
         if event.type == pygame.KEYDOWN:
             if event.key in (pygame.K_ESCAPE, pygame.K_q):
                 return False
-            if event.key == pygame.K_SPACE:
+            if event.key in (pygame.K_SPACE, pygame.K_a, pygame.K_s, pygame.K_b, pygame.K_u, pygame.K_m):
+                self.stop_worker()
+            if event.key == pygame.K_TAB:
+                self.show_help = not self.show_help
+            elif event.key == pygame.K_F1:
+                self.show_hud = not self.show_hud
+            elif event.key == pygame.K_v and self.renderer:
+                self.renderer.mode = "density" if self.renderer.mode == "cinematic" else "cinematic"
+            elif event.key in (pygame.K_COMMA, pygame.K_PERIOD) and self.renderer:
+                factor = 1.2 if event.key == pygame.K_PERIOD else 1/1.2
+                self.renderer.exposure = min(8., max(.15, self.renderer.exposure*factor))
+            elif event.key == pygame.K_SPACE:
                 self.paused = not self.paused
             elif event.key == pygame.K_h:
                 self.show_tree = not self.show_tree
@@ -368,7 +421,7 @@ class GravityApp:
                     if not cuda_available():
                         raise RuntimeError("No CUDA device detected")
                     # Compile and exercise the real kernel before changing the selection.
-                    verify_device()
+                    verify_device(use_graphs=self.use_graphs)
                     self.sim.cuda_enabled = True
                     self.sim.solver_mode = "cuda-exact"
                     self.diagnostic_text = "CUDA exact active (FP32). S/B cycles all enabled solvers."
@@ -400,10 +453,10 @@ class GravityApp:
                     self.reference_pick_armed = not self.reference_pick_armed
             elif event.key == pygame.K_c:
                 self.spawn_color_index = (self.spawn_color_index + 1) % len(PALETTE)
-            elif event.key in (pygame.K_RIGHTBRACKET, pygame.K_PERIOD):
+            elif event.key in (pygame.K_RIGHTBRACKET,):
                 self.spawn_radius = min(30.0, self.spawn_radius + 1.0)
                 self.spawn_mass = min(200.0, self.spawn_mass * 1.35)
-            elif event.key in (pygame.K_LEFTBRACKET, pygame.K_COMMA):
+            elif event.key in (pygame.K_LEFTBRACKET,):
                 self.spawn_radius = max(2.0, self.spawn_radius - 1.0)
                 self.spawn_mass = max(0.1, self.spawn_mass / 1.35)
             elif event.key in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
@@ -428,31 +481,109 @@ class GravityApp:
         elif event.type == pygame.MOUSEMOTION and self.drag_start is not None:
             dx = event.pos[0] - self.drag_start[0]
             dy = event.pos[1] - self.drag_start[1]
+            if self.renderer:
+                self.renderer.reset_history()
             self.camera_x -= dx / self.zoom
             self.camera_y -= dy / self.zoom
             self.drag_start = event.pos
         return True
 
     def handle_event(self, event: pygame.event.Event) -> bool:
+        if event.type == pygame.VIDEORESIZE and self.renderer:
+            self.screen = pygame.Surface((max(1,event.w), max(1,event.h)), pygame.SRCALPHA)
+            self.renderer.reset_history()
+            return True
         if self.mode == "menu":
             return self.handle_menu_event(event)
         return self.handle_simulation_event(event)
 
+    def consume_snapshot(self, snapshot):
+        if snapshot is None or snapshot.sequence == self._snapshot_seq:
+            return False
+        if len(snapshot.positions) != len(self.sim.bodies):
+            raise RuntimeError("Stale physics snapshot: particle counts differ")
+        self._snapshot_seq = snapshot.sequence
+        self.render_positions = snapshot.positions
+        for body, p, v in zip(self.sim.bodies, snapshot.positions, snapshot.velocities):
+            body.x, body.y = map(float, p)
+            body.vx, body.vy = map(float, v)
+        self.effective_time_scale = snapshot.effective_speed
+        self.worker_stats = snapshot
+        self._render_token += 1
+        return True
+
+    def stop_worker(self):
+        # Coordinated state is already synchronized and reflected in Body objects.
+        self._frame_controller = None
+        if self._worker is not None:
+            worker = self._worker
+            snapshot = worker.close()
+            self.consume_snapshot(snapshot)
+            self._worker = None
+            self._snapshot_seq = -1
+            if worker.error:
+                self.paused = True
+                self.diagnostic_text = "Physics stopped: " + worker.error
+                print(self.diagnostic_text, file=sys.stderr)
+
     def update(self, elapsed: float = 1/60) -> None:
         if self.mode != "simulation":
             return
-        if not self.paused:
+        changed = False
+        if self.sim.active_solver == "cuda-exact" and self.threaded:
+            if not self.paused and self._worker is None:
+                from physics_worker import PhysicsWorker
+                self._snapshot_seq = -1
+                self._worker = PhysicsWorker(self.sim.bodies, self.sim.G, self.sim.softening,
+                    self.sim.background, dt=self.physics_clock.timestep, speed=self.time_scale,
+                    use_graphs=self.use_graphs)
+            if self._worker:
+                self._worker.controls(self.physics_clock.timestep, self.time_scale, self.paused)
+                changed = self.consume_snapshot(self._worker.latest())
+                if self._worker.error:
+                    self.stop_worker()
+            if self.paused:
+                self.effective_time_scale = 0.
+        elif self.sim.active_solver == "cuda-exact":
+            if self._worker:
+                self.stop_worker()
+            if self._frame_controller is None and not self.paused:
+                from cuda_controller import CudaFrameController
+                self._frame_controller = CudaFrameController(self.sim.bodies,self.sim.G,
+                    self.sim.softening,self.sim.background,use_graphs=self.use_graphs)
+            count = self.physics_clock.advance_batches(
+                self._frame_controller.batch if self._frame_controller else lambda n,dt: None,
+                elapsed,self.time_scale,paused=self.paused)
+            if count:
+                pos,vel=self._frame_controller.snapshot()
+                self.render_positions=pos
+                for body,p,v in zip(self.sim.bodies,pos,vel):
+                    body.x,body.y=map(float,p)
+                    body.vx,body.vy=map(float,v)
+                self._render_token+=1
+                changed=True
+                self.worker_stats=self._frame_controller
+            self.effective_time_scale=self.physics_clock.effective_speed
+        else:
+            self.stop_worker()
+            if not self.paused:
+                self.sim.begin_device_frame()
+            try:
+                count = self.physics_clock.advance(self.sim.step, elapsed, self.time_scale, paused=self.paused)
+            finally:
+                self.sim.end_device_frame()
+            self.effective_time_scale = self.physics_clock.effective_speed
+            changed = count > 0
+            self.render_positions = None
+            if changed:
+                self._render_token += 1
+        if changed:
             self.diagnostic_points = []
-            self.sim.begin_device_frame()
-        try:
-            self.physics_clock.advance(self.sim.step, elapsed, self.time_scale, paused=self.paused)
-        finally:
-            self.sim.end_device_frame()
-        self.effective_time_scale = self.physics_clock.effective_speed
-
-        self.ensure_trails()
-        for trail, body in zip(self.trails, self.sim.bodies):
-            trail.append((body.x, body.y))
+            # OpenGL trails use GPU image history; avoid 5000 Python trail queues.
+            if self.renderer is None:
+                self.ensure_trails()
+                for trail, body in zip(self.trails, self.sim.bodies):
+                    trail.append((body.x, body.y))
 
     def draw_grid(self) -> None:
         w, h = self.screen.get_size()
@@ -501,46 +632,52 @@ class GravityApp:
         return points
 
     def draw_menu(self) -> None:
-        self.screen.fill(BACKGROUND)
-        w, h = self.screen.get_size()
-        title = self.big_font.render("Choose a Starting System", True, TEXT)
-        subtitle = self.font.render("Click a template or press 1 / 2 / 3 / 4", True, MUTED)
-        self.screen.blit(title, (w // 2 - title.get_width() // 2, 42))
-        self.screen.blit(subtitle, (w // 2 - subtitle.get_width() // 2, 86))
-
-        mouse = pygame.mouse.get_pos()
-        card_w = min(780, w - 80)
-        card_h = 105
-        gap = 12
-        top = 130
-        self.menu_rects = {}
-
-        for i, scenario in enumerate(SCENARIOS):
-            rect = pygame.Rect((w - card_w) // 2, top + i * (card_h + gap), card_w, card_h)
-            self.menu_rects[scenario.key] = rect
-            color = PANEL_HOVER if rect.collidepoint(mouse) else PANEL
-            pygame.draw.rect(self.screen, color, rect, border_radius=12)
-            pygame.draw.rect(self.screen, ACCENT, rect, 2, border_radius=12)
-
-            number = self.title_font.render(str(i + 1), True, ACCENT)
-            scenario_title = self.title_font.render(scenario.title, True, TEXT)
-            desc = self.small_font.render(scenario.description, True, MUTED)
-            self.screen.blit(number, (rect.x + 22, rect.y + 16))
-            self.screen.blit(scenario_title, (rect.x + 62, rect.y + 15))
-            self.screen.blit(desc, (rect.x + 62, rect.y + 53))
-
-        note = self.small_font.render(
-            "Galaxy: violet starlight, a luminous bulge, and freely evolving arms.", True, MUTED
-        )
-        note_y = top + len(SCENARIOS) * (card_h + gap) + 8
-        self.screen.blit(note, (w // 2 - note.get_width() // 2, note_y))
-        pygame.display.flip()
+        self.screen.fill((0,0,0,0) if self.renderer else BACKGROUND)
+        w,h=self.screen.get_size()
+        margin=max(24,min(70,w//20))
+        card_w=min(475,w-2*margin)
+        # A translucent scrim preserves contrast while leaving the galaxy visible.
+        if self.renderer:
+            for x in range(0,min(w,760),8):
+                alpha=int(235*(1-min(1,x/760))**.5)
+                pygame.draw.rect(self.screen,(7,11,22,alpha),(x,0,8,h))
+        def label(value,xy,font,color):
+            self.screen.blit(font.render(value,True,color),xy)
+        label("G R A V I T Y   /   L A B",(margin,40),self.small_font,(137,172,196))
+        label("Observatory",(margin,78),self.big_font,TEXT)
+        label("Explore the patterns gravity leaves behind.",(margin,126),self.small_font,MUTED)
+        top=184
+        card_h=min(92,max(60,(h-top-90)//4-12))
+        mouse=pygame.mouse.get_pos()
+        self.menu_rects={}
+        descriptions={"solar":"Nine bodies. A familiar celestial clock.",
+                      "binary":"Two suns and a shared gravitational dance.",
+                      "random":"A new rotating system with every visit.",
+                      "galaxy":f"{self.galaxy_particles:,} stars. One evolving stellar disk."}
+        for i,scenario in enumerate(SCENARIOS):
+            rect=pygame.Rect(margin,top+i*(card_h+12),card_w,card_h)
+            self.menu_rects[scenario.key]=rect
+            hover=rect.collidepoint(mouse)
+            pygame.draw.rect(self.screen,(23,33,52,245) if hover else (13,22,37,225),rect,border_radius=12)
+            pygame.draw.rect(self.screen,(75,128,159) if hover else (37,53,76),rect,1,border_radius=12)
+            label(f"0{i+1}",(rect.x+17,rect.y+18),self.font,(147,177,201))
+            label(scenario.title,(rect.x+62,rect.y+13),self.title_font,TEXT)
+            if card_h>=72:
+                label(descriptions[scenario.key],(rect.x+62,rect.y+49),self.small_font,MUTED)
+        label("SELECT A SYSTEM   /   CLICK OR PRESS 1—4",(margin,h-42),self.small_font,(117,143,169))
+        if w>1050:
+            if self.gpu_profile:
+                p=self.gpu_profile
+                label(f"AUTO  /  {p.particles:,} STARS  /  {p.total_vram_gib:.0f} GiB VRAM",(w-430,h-42),self.small_font,(113,139,165))
+            else:
+                label("A QUIET GALAXY, WAITING TO MOVE",(w-405,h-42),self.small_font,(113,109,145))
+        self.present()
 
     def draw_simulation(self) -> None:
-        self.screen.fill(BACKGROUND)
+        self.screen.fill((0, 0, 0, 0) if self.renderer else BACKGROUND)
         if self.current_scenario != "galaxy":
             self.draw_grid()
-        elif self.show_glow:
+        elif self.show_glow and self.renderer is None:
             self.galaxy_lighting.draw_bulge(self.screen,self.world_to_screen(0,0),self.zoom)
 
         if self.show_tree:
@@ -561,74 +698,99 @@ class GravityApp:
                     tip = (end[0]-6*math.cos(angle+delta), end[1]-6*math.sin(angle+delta))
                     pygame.draw.line(self.screen, color, end, tip, 2)
 
-        if self.show_trails:
+        if self.show_trails and self.renderer is None:
             for i, body in enumerate(self.sim.bodies):
                 points = self.transformed_trail_points(i)
                 if len(points) >= 2:
                     pygame.draw.lines(self.screen, body.color, False, points, 1)
 
-        for body in self.sim.bodies:
-            sx, sy = self.world_to_screen(body.x, body.y)
-            if self.current_scenario == "galaxy" and self.show_glow:
-                self.galaxy_lighting.draw_star(self.screen,body,(sx,sy),self.zoom)
-            radius = max(1, round(body.radius * min(self.zoom, 2.2)))
-            pygame.draw.circle(self.screen, body.color, (sx, sy), radius)
-            if body is self.reference_body:
-                pygame.draw.circle(self.screen, LOCK_COLOR, (sx, sy), radius + 5, 2)
-
-        status = "PAUSED" if self.paused else "RUNNING"
-        solver = {"fmm": "FMM", "barnes-hut": "Barnes-Hut", "exact": "Exact", "cuda-exact": "CUDA exact FP32"}[self.sim.active_solver]
-        if self.sim.solver == "auto":
-            solver += " (auto)"
-        ref_name = self.reference_body.name if self.reference_index() is not None else "World"
-        header = (
-            f"{status}   bodies={len(self.sim.bodies)}   solver={solver}   "
-            f"speed={self.effective_time_scale:.1f}x/{self.time_scale:g}x   zoom={self.zoom:.2f}x   frame={ref_name}"
-        )
-        self.screen.blit(self.font.render(header, True, TEXT), (16, 14))
-        self.screen.blit(self.small_font.render(f"{self.clock.get_fps():.0f} FPS | {self.diagnostic_text}", True, MUTED), (16, self.screen.get_height()-26))
-
-        spawn_text = (
-            f"New body: radius={self.spawn_radius:.0f}  mass={self.spawn_mass:.2f}  "
-            "color="
-        )
-        spawn_surface = self.small_font.render(spawn_text, True, MUTED)
-        self.screen.blit(spawn_surface, (16, 43))
-        swatch_x = 16 + spawn_surface.get_width() + 8
-        pygame.draw.circle(self.screen, self.spawn_color, (swatch_x + 8, 51), 7)
-
-        factor = 2**self.physics_clock.timestep_level
-        dt_text = f"dt={self.physics_clock.timestep:g} ({factor:g}x step)"
-        if factor > 2:
-            dt_text += "  COARSE"
-        dt_color = LOCK_COLOR if factor > 2 else MUTED
-        self.screen.blit(self.small_font.render(dt_text, True, dt_color), (swatch_x+35, 43))
-
-        if self.reference_pick_armed:
-            pick_text = "REFERENCE PICK: click a body to make it the stationary center"
-            self.screen.blit(self.font.render(pick_text, True, LOCK_COLOR), (16, 67))
-            controls_y = 94
+        if self.renderer is None:
+            for body in self.sim.bodies:
+                sx, sy = self.world_to_screen(body.x, body.y)
+                if self.current_scenario == "galaxy" and self.show_glow:
+                    self.galaxy_lighting.draw_star(self.screen,body,(sx,sy),self.zoom)
+                radius = max(1, round(body.radius * min(self.zoom, 2.2)))
+                pygame.draw.circle(self.screen, body.color, (sx, sy), radius)
+                if body is self.reference_body:
+                    pygame.draw.circle(self.screen, LOCK_COLOR, (sx, sy), radius + 5, 2)
         elif self.reference_body is not None:
-            vx, vy = self.reference_body.vx, self.reference_body.vy
-            ref_text = (
-                f"Reference frame: {self.reference_body.name} "
-                f"(subtracting v=<{vx:.3g}, {vy:.3g}>)   F: release"
-            )
-            self.screen.blit(self.small_font.render(ref_text, True, LOCK_COLOR), (16, 68))
-            controls_y = 92
-        else:
-            controls_y = 68
+            b = self.reference_body
+            pygame.draw.circle(self.screen, LOCK_COLOR, self.world_to_screen(b.x,b.y), 10, 1)
 
-        controls = [
-            "PgUp/PgDn: larger/smaller timestep (accuracy vs speed)   0: default step   G: galaxy glow",
-            "Left click: add custom body   Right click: remove nearest   Middle-drag: pan",
-            "F then click body: lock moving reference frame   F again: return to world frame",
-            "C: color   [ / ]: smaller/larger body   +/-: speed (up to 4096x)   T: trails",
-            "S/B: solver   Mouse wheel: zoom   Space: pause   R: reset   M: scenario menu   Esc/Q: quit",
-        ]
-        for i, line in enumerate(controls):
-            self.screen.blit(self.small_font.render(line, True, MUTED), (16, controls_y + 21 * i))
+        if self.show_hud:
+            self.draw_hud()
+        self.present()
 
+    def draw_hud(self):
+        w, h = self.screen.get_size()
+        def text(value, xy, color=MUTED, font=None):
+            self.screen.blit((font or self.small_font).render(value, True, color), xy)
+        pygame.draw.rect(self.screen, (10, 15, 29, 225), (16,16,min(440,w-32),96), border_radius=12)
+        text("O B S E R V A T O R Y", (30,26), (220,225,248), self.font)
+        mode = self.renderer.mode.upper() if self.renderer else "SOFTWARE"
+        text(f"{len(self.sim.bodies):,} particles   {mode}   {self.clock.get_fps():.0f} FPS", (30,54))
+        text(f"{self.sim.active_solver}   dt {self.physics_clock.timestep:g}", (30,78), (142,180,227))
+        state = "PAUSED" if self.paused else f"{self.effective_time_scale:.1f}x / {self.time_scale:g}x"
+        state_surface = self.font.render(state, True, (225,198,144))
+        status_x = max(24,w-state_surface.get_width()-28)
+        status_y = 28 if w>=900 else 122
+        self.screen.blit(state_surface, (status_x,status_y))
+        steps_s=0. if self.paused else self.effective_time_scale*2.7/self.physics_clock.timestep
+        if w>=900:
+            text(f"{steps_s:,.0f} steps/s",(w-180,54),(151,170,192))
+        if self.worker_stats:
+            a=self.worker_stats
+            text(f"batch {a.batch_size} / {a.batch_ms:.2f} ms   copy {a.transfer_ms:.2f} ms", (max(24,w-345),78 if w>=900 else 151))
+        if self.renderer and self.renderer.mode=="density":
+            text("MASS DENSITY  /  LOG SCALE  /  BLUE → GOLD", (30,124 if w>=900 else 177), (217,173,235))
+        if self.reference_body:
+            text(f"FRAME / {self.reference_body.name}", (30,146), LOCK_COLOR)
+        elif self.reference_pick_armed:
+            text("Click a particle to follow it", (30,146), LOCK_COLOR)
+        text("TAB help   F1 clean view   V density   T trails   SPACE pause", (24,h-52))
+        text(self.diagnostic_text, (24,h-29), (113,135,165))
+        if self.show_help:
+            lines=[
+                "CONTROLS",
+                "+/- speed | PgUp/PgDn timestep | 0 reset timestep",
+                "S/B solver | U enable CUDA | G glow | T trails",
+                "V cinematic/density | comma/period exposure",
+                "H spatial tree | A pause + sample force errors",
+                "Wheel zoom | middle-drag pan | F follow particle",
+                "Left add | right remove | C color | [ ] body size",
+                f"New body: mass {self.spawn_mass:.2f}, radius {self.spawn_radius:g}",
+                "R reset | M scenario menu | Esc quit",
+                "OpenGL trails: fading screen-space exposure",
+            ]
+            y=180 if w>=900 else 210
+            pygame.draw.rect(self.screen, (11,17,32,240), (16,y,min(620,w-32),len(lines)*25+24),border_radius=12)
+            for i,line in enumerate(lines):
+                if y+12+i*25<h-65:
+                    text(line,(30,y+12+i*25), TEXT if i==0 else MUTED)
+
+    def present(self):
+        if self.renderer:
+            if self.mode=="menu":
+                if self._menu_preview is None:
+                    bs=spiral_galaxy(star_count=1800)
+                    self._menu_preview=(bs,np.array([(b.x,b.y) for b in bs],dtype='f4'))
+                w,h=self.screen.get_size()
+                zoom=min(w,h)*.54/850
+                view=self.renderer.mode
+                self.renderer.mode="cinematic"
+                self.renderer.render(self.screen,*self._menu_preview,
+                    (-w*.22/zoom,0.),zoom,galaxy=True,paused=True)
+                self.renderer.mode=view
+                pygame.display.flip()
+                return
+            positions=self.render_positions
+            if positions is None:
+                positions=np.asarray([(b.x,b.y) for b in self.sim.bodies],dtype='f4').reshape(-1,2)
+            rx,ry=self.reference_origin()
+            self.renderer.render(self.screen,self.sim.bodies,positions,
+                (rx+self.camera_x,ry+self.camera_y),self.zoom,
+                trails=self.show_trails,glow=self.show_glow,galaxy=self.current_scenario=="galaxy",
+                token=self._render_token,paused=self.paused,menu=self.mode=="menu")
         pygame.display.flip()
 
     def draw(self) -> None:
@@ -640,35 +802,72 @@ class GravityApp:
     def run(self) -> None:
         running = True
         last_tick = time.perf_counter()
-        while running:
-            now = time.perf_counter()
-            elapsed = now-last_tick
-            last_tick = now
-            for event in pygame.event.get():
-                running = self.handle_event(event)
+        try:
+            while running:
+                now = time.perf_counter()
+                elapsed = now-last_tick
+                last_tick = now
+                for event in pygame.event.get():
+                    running = self.handle_event(event)
+                    if not running:
+                        break
                 if not running:
                     break
-            self.update(elapsed)
-            self.draw()
-            self.clock.tick(60)
-
-        pygame.quit()
+                self.update(elapsed)
+                render_start = time.perf_counter()
+                self.draw()
+                if self.renderer:
+                    self.renderer.ctx.finish()
+                render_cost = time.perf_counter()-render_start
+                previous_render = getattr(self,"_render_cost",render_cost)
+                self._render_cost = .85*previous_render+.15*render_cost
+                self.physics_clock.budget_seconds = max(.001,min(.012,1/60-self._render_cost-.002))
+                self.clock.tick(60)
+        finally:
+            self.stop_worker()
+            if self.renderer:
+                self.renderer.release()
+            pygame.quit()
 
 
 def main() -> int:
     try:
         parser = argparse.ArgumentParser()
         parser.add_argument("--solver", choices=("fmm", "exact", "barnes-hut", "auto", "cuda-exact"), default="fmm")
-        parser.add_argument("--galaxy-particles", type=int, default=1200)
+        parser.add_argument("--galaxy-particles", default="auto", help="auto benchmarks the GPU; or supply an integer >=2")
+        parser.add_argument("--renderer", choices=("auto", "opengl", "software"), default="auto")
+        parser.add_argument("--threaded", action="store_true", help="Experimental concurrent CUDA worker; default is coordinated frame pacing")
+        parser.add_argument("--no-threading", action="store_true", help=argparse.SUPPRESS)
+        parser.add_argument("--no-graphs", action="store_true")
         args = parser.parse_args()
-        if args.galaxy_particles < 2:
-            parser.error("--galaxy-particles must be at least 2")
+        if args.galaxy_particles!="auto":
+            try:
+                args.galaxy_particles=int(args.galaxy_particles)
+            except ValueError:
+                parser.error("--galaxy-particles must be auto or an integer")
+            if args.galaxy_particles<2:
+                parser.error("--galaxy-particles must be at least 2")
+        profile=None
         if args.solver == "cuda-exact":
             from cuda_gravity import cuda_available, verify_device
             if not cuda_available():
                 raise RuntimeError("CUDA requested but no NVIDIA CUDA device is available")
-            print(f"CUDA startup checks passed: {verify_device()}")
-        GravityApp(args.solver, args.galaxy_particles).run()
+            print(f"CUDA startup checks passed: {verify_device(use_graphs=not args.no_graphs)}")
+        if args.galaxy_particles=="auto":
+            if args.solver=="cuda-exact":
+                from gpu_profile import calibrate
+                print("Calibrating a starting population on your GPU...")
+                profile=calibrate(use_graphs=not args.no_graphs)
+                args.galaxy_particles=profile.particles
+                print(f"{profile.device}: {profile.total_vram_gib:.1f} GiB VRAM, "
+                      f"{profile.free_vram_gib:.1f} GiB free; selected {profile.particles:,} particles "
+                      f"at {profile.measured_step_ms:.3f} ms/step (physics only).")
+            else:
+                args.galaxy_particles=1200
+        app=GravityApp(args.solver, args.galaxy_particles, renderer=args.renderer,
+                      threaded=args.threaded and not args.no_threading, use_graphs=not args.no_graphs)
+        app.gpu_profile=profile
+        app.run()
         return 0
     except (pygame.error, ImportError, RuntimeError) as exc:
         print(f"Simulator could not start: {exc}", file=sys.stderr)

@@ -59,3 +59,46 @@ class FixedStepClock:
             self.effective_speed = self._advanced/(2.7*self._wall)
             self._wall = self._advanced = 0.0
         return count
+
+    def advance_batches(self, step_batch, elapsed, speed, *, paused=False,
+                        clock=time.perf_counter):
+        """Frame-budgeted batches. step_batch(count, dt) must finish GPU work.
+
+        Retains the fixed-step/speed contract of advance(). Batch size adapts to
+        measured cost, bounded by 16 and the remaining frame budget. No worker
+        thread or render/physics concurrency is involved in this default path.
+        """
+        if paused:
+            self.pending = self._wall = self._advanced = 0.0
+            self.effective_speed = 0.0
+            return 0
+        if elapsed < 0 or speed < 0 or not math.isfinite(elapsed+speed):
+            raise ValueError('Finite nonnegative elapsed time and speed required')
+        self.pending += min(elapsed,.25)*2.7*speed
+        start = clock()
+        count = 0
+        cost = getattr(self,'_batch_step_cost',.001)
+        while self.pending+1e-12 >= self.timestep and count < self.max_steps:
+            remaining = self.budget_seconds-(clock()-start)
+            if count and remaining <= 0:
+                break
+            due = int((self.pending+1e-12)/self.timestep)
+            capacity = max(1,min(16, self.max_steps-count, int(max(0.,remaining)/max(cost,1e-6))))
+            batch = 2**int(math.log2(min(due,capacity)))
+            before = clock()
+            step_batch(batch,self.timestep)
+            duration = max(1e-6,clock()-before)
+            cost = .65*cost+.35*duration/batch
+            self.pending = max(0.,self.pending-batch*self.timestep)
+            count += batch
+            if clock()-start >= self.budget_seconds:
+                break
+        self._batch_step_cost = cost
+        if self.pending >= self.timestep:
+            self.pending %= self.timestep
+        self._wall += elapsed
+        self._advanced += count*self.timestep
+        if self._wall >= .5:
+            self.effective_speed = self._advanced/(2.7*self._wall)
+            self._wall = self._advanced = 0.
+        return count
