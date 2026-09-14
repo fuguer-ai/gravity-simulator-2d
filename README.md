@@ -362,3 +362,10 @@ are rendering presets, not a hydrodynamics or temperature simulation. Filament
 texture is world-anchored; it does not keep animating when physics is paused.
 Bloom, exposure, haze, and flares remain available. Experimental: no tests run
 for this update, per request. Wider splats cost additional pixel overdraw.
+
+### Hybrid plasma accent
+
+From the default hybrid view, press **V once** for **hybrid plasma**. It retains
+hybrid stars, density colors, and cloud detail, adding a restrained 22% warm
+plasma-emission accent before tone mapping. Original hybrid remains available.
+No new render passes or dependencies; no tests run for this visual experiment.

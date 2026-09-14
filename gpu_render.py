@@ -127,10 +127,18 @@ void main(){
     float d=texture(density_tex,uv).r;
     vec3 unresolved=vec3(.07,.027,.105)*log(1.+d*.20);
     radiance+=bloom_strength*texture(bloom,uv).rgb+bulge+unresolved*bloom_strength;
-    if(hybrid==1){
+    if(hybrid>0){
         float heat=clamp(log(1.+d*exposure*.35)/3.6,0.,1.);
         // Same log palette as density mode, combined in HDR before tone mapping.
         radiance+=palette(heat)*smoothstep(0.,.12,heat)*(.16+heat*1.1);
+    }
+    if(hybrid==2){
+        // Preserve hybrid detail; add a restrained warm emission accent in HDR.
+        float heat=clamp(log(1.+d*.45)/3.,0.,1.);
+        float opacity=1.-exp(-d*.10);
+        vec3 warmth=mix(vec3(.65,.018,.055),vec3(1.5,.35,.025),smoothstep(.05,.55,heat));
+        warmth=mix(warmth,vec3(2.,1.6,.85),smoothstep(.5,1.,heat));
+        radiance+=.22*warmth*opacity*(.35+heat);
     }
     if(plasma>0){
         // Broad Gaussian splats exp(-4 r²): overlapping gas envelopes.
@@ -353,7 +361,7 @@ class GalaxyRenderer:
         self.density_field[0].use(3)
         for name,value in dict(scene=0,bloom=1,overlay=2,density_tex=3,exposure=self.exposure,
                                bloom_strength=.8 if glow else 0.,density=int(self.mode=='density'),
-                               galaxy=int(galaxy and glow),hybrid=int(self.mode=='hybrid'),
+                               galaxy=int(galaxy and glow),hybrid={'hybrid':1,'hybrid plasma':2}.get(self.mode,0),
                                plasma={'plasma':1,'molten':2,'wisps':3}.get(self.mode,0),
                                mist=int(self.mist),flares=int(self.flares),viewport=size,origin=origin,zoom=zoom).items():
             self.composite[name]=value

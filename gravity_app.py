@@ -401,7 +401,7 @@ class GravityApp:
             elif event.key == pygame.K_F1:
                 self.show_hud = not self.show_hud
             elif event.key == pygame.K_v and self.renderer:
-                modes = ("cinematic", "density", "hybrid", "plasma", "molten", "wisps")
+                modes = ("cinematic", "density", "hybrid", "hybrid plasma", "plasma", "molten", "wisps")
                 self.renderer.mode = modes[(modes.index(self.renderer.mode)+1)%len(modes)]
             elif event.key == pygame.K_p and self.renderer:
                 modes = ("plasma", "molten", "wisps")
