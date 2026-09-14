@@ -144,8 +144,11 @@ class NBodySimulation:
     ) -> None:
         if solver_mode is not None:
             solver = solver_mode
-        if solver not in ("auto", "exact", "barnes-hut", "fmm"):
+        if solver not in ("auto", "exact", "barnes-hut", "fmm", "cuda-exact"):
             raise ValueError("Unknown solver: " + solver)
+        self._gpu_state = None
+        self._gpu_batch = False
+        self.cuda_enabled = solver == "cuda-exact"
         self.background = background
         self.solver = solver
         self.fmm_theta = float(fmm_theta)
@@ -170,6 +173,10 @@ class NBodySimulation:
 
     def _self_accelerations(self) -> list[tuple[float, float]]:
         selected = self.active_solver
+        if selected == "cuda-exact":
+            from cuda_gravity import DeviceState
+            state = DeviceState(self.bodies, self.G, self.softening)
+            return [tuple(map(float, a)) for a in state.force().numpy()[:len(self.bodies)]]
         if selected == "exact":
             return self._accelerations_exact()
         if selected == "barnes-hut":
@@ -187,12 +194,14 @@ class NBodySimulation:
 
     @solver_mode.setter
     def solver_mode(self, value: str) -> None:
-        if value not in ("auto", "exact", "barnes-hut", "fmm"):
+        if value not in ("auto", "exact", "barnes-hut", "fmm", "cuda-exact"):
             raise ValueError("Unknown solver: " + value)
         self.solver = value
 
     def cycle_solver(self) -> str:
         order = ("auto", "fmm", "barnes-hut", "exact")
+        if self.cuda_enabled or self.solver == "cuda-exact":
+            order += ("cuda-exact",)
         self.solver_mode = order[(order.index(self.solver_mode)+1) % len(order)]
         return self.solver_mode
 
@@ -307,9 +316,48 @@ class NBodySimulation:
 
         return result
 
+    def begin_device_frame(self):
+        """Upload public Body state once; device steps then run without host copies.
+
+        Call end_device_frame before reading/editing bodies or changing solvers.
+        The application brackets each physics frame with this pair.
+        """
+        if self._gpu_batch:
+            raise RuntimeError("Device frame already open")
+        if self.active_solver != "cuda-exact":
+            return
+        from cuda_gravity import DeviceState
+        config = (len(self.bodies), self.G, self.softening, self.background)
+        if self._gpu_state is None or self._gpu_config != config:
+            self._gpu_state = DeviceState(self.bodies, self.G, self.softening, self.background)
+            self._gpu_config = config
+        else:
+            self._gpu_state.upload(self.bodies)
+        self._gpu_batch = True
+
+    def end_device_frame(self):
+        if self._gpu_batch:
+            try:
+                self._gpu_state.download(self.bodies)
+            finally:
+                self._gpu_batch = False
+
     def step(self, dt: float) -> None:
         """Advance one time step using velocity-Verlet integration."""
         if not self.bodies:
+            return
+
+        if self.active_solver == "cuda-exact":
+            owns_frame = not self._gpu_batch
+            if owns_frame:
+                self.begin_device_frame()
+            try:
+                self._gpu_state.step(dt)
+                # Charge actual GPU work to the pacing budget, not just enqueue time.
+                self._gpu_state.synchronize()
+            finally:
+                if owns_frame:
+                    self.end_device_frame()
             return
 
         a0 = self.accelerations()

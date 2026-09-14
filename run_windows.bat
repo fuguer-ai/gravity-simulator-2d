@@ -2,6 +2,11 @@
 setlocal
 cd /d "%~dp0"
 
+if exist ".venv\Scripts\python.exe" (
+    set PYTHON=.venv\Scripts\python.exe
+    goto :run
+)
+
 where py >nul 2>nul
 if %errorlevel%==0 (
     set PYTHON=py
@@ -9,6 +14,7 @@ if %errorlevel%==0 (
     set PYTHON=python
 )
 
+:run
 %PYTHON% -m pip install -r requirements.txt
 if errorlevel 1 goto :error
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import math
 import random
 import sys
@@ -144,18 +145,18 @@ def randomized_system(count: int = 120) -> list[Body]:
     return bodies
 
 
-def scenario_bodies(key: str) -> tuple[list[Body], float, float]:
+def scenario_bodies(key: str, galaxy_particles: int = 1200) -> tuple[list[Body], float, float]:
     if key == "solar":
         return solar_system(), 0.08, 0.58
     if key == "binary":
         return binary_system(), 2.5, 0.95
     if key == "galaxy":
-        return spiral_galaxy(), GALAXY_SOFTENING, 0.62
+        return spiral_galaxy(star_count=galaxy_particles), GALAXY_SOFTENING, 0.62
     return randomized_system(), 3.0, 0.92
 
 
 class GravityApp:
-    def __init__(self) -> None:
+    def __init__(self, solver="fmm", galaxy_particles=1200) -> None:
         pygame.init()
         pygame.display.set_caption("2D Gravity Simulator")
         self.screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
@@ -165,12 +166,16 @@ class GravityApp:
         self.big_font = pygame.font.SysFont("consolas", 34, bold=True)
         self.title_font = pygame.font.SysFont("consolas", 23, bold=True)
 
+        self.galaxy_particles = galaxy_particles
+        self.show_tree = False
+        self.diagnostic_points = []
+        self.diagnostic_text = "H: spatial tree   A: pause + force error   U: CUDA exact"
         self.galaxy_lighting = GalaxyLighting()
         self.show_glow = True
         self.physics_clock = FixedStepClock()
         self.mode = "menu"
         self.current_scenario = "solar"
-        self.sim = NBodySimulation([], softening=3.0, solver="fmm")
+        self.sim = NBodySimulation([], softening=3.0, solver=solver)
         self.paused = False
         self.show_trails = True
         self.time_scale = 1.0
@@ -219,11 +224,15 @@ class GravityApp:
         self.camera_y = 0.0
 
     def load_scenario(self, key: str) -> None:
-        bodies, softening, zoom = scenario_bodies(key)
+        bodies, softening, zoom = scenario_bodies(key, self.galaxy_particles)
         self.physics_clock = FixedStepClock(timestep=.5 if key == "galaxy" else .045)
         self.current_scenario = key
+        cuda_enabled = self.sim.cuda_enabled
         self.sim = NBodySimulation(bodies, softening=softening, solver=self.sim.solver,
                                    background=GALAXY_BACKGROUND if key == "galaxy" else None)
+        self.sim.cuda_enabled = cuda_enabled
+        self.diagnostic_points = []
+        self.diagnostic_text = "H: spatial tree   A: pause + force error   U: CUDA exact"
         self.trail_maxlen = 120 if key == "galaxy" else 600
         self.trails = []
         self.ensure_trails()
@@ -300,6 +309,7 @@ class GravityApp:
             )
         )
         self.ensure_trails()
+        self.diagnostic_points = []
 
     def remove_nearest(self, pos: tuple[int, int]) -> None:
         if not self.sim.bodies:
@@ -312,6 +322,7 @@ class GravityApp:
         removed = self.sim.bodies[index]
         del self.sim.bodies[index]
         del self.trails[index]
+        self.diagnostic_points = []
         if removed is self.reference_body:
             self.clear_reference()
 
@@ -344,12 +355,34 @@ class GravityApp:
                 return False
             if event.key == pygame.K_SPACE:
                 self.paused = not self.paused
+            elif event.key == pygame.K_h:
+                self.show_tree = not self.show_tree
+            elif event.key == pygame.K_a:
+                from diagnostics import force_sample
+                self.paused = True
+                self.diagnostic_points, error = force_sample(self.sim)
+                self.diagnostic_text = f"Paused force sample: RMS error {error:.3%}; green <1%, amber <5%, red >=5%"
+            elif event.key == pygame.K_u:
+                try:
+                    from cuda_gravity import cuda_available, verify_device
+                    if not cuda_available():
+                        raise RuntimeError("No CUDA device detected")
+                    # Compile and exercise the real kernel before changing the selection.
+                    verify_device()
+                    self.sim.cuda_enabled = True
+                    self.sim.solver_mode = "cuda-exact"
+                    self.diagnostic_text = "CUDA exact active (FP32). S/B cycles all enabled solvers."
+                except (ImportError, RuntimeError) as exc:
+                    self.diagnostic_text = "CUDA unavailable; see console. CPU solvers remain active."
+                    print(f"CUDA setup: {exc}. Run run_windows_cuda.bat to install Warp.", file=sys.stderr)
             elif event.key == pygame.K_r:
                 self.reset()
             elif event.key == pygame.K_m:
                 self.mode = "menu"
             elif event.key in (pygame.K_s, pygame.K_b):
                 self.sim.cycle_solver()
+                self.diagnostic_points = []
+                self.diagnostic_text = "H: spatial tree   A: pause + force error   U: CUDA exact"
             elif event.key == pygame.K_PAGEUP:
                 self.physics_clock.adjust_timestep(1)
             elif event.key == pygame.K_PAGEDOWN:
@@ -408,7 +441,13 @@ class GravityApp:
     def update(self, elapsed: float = 1/60) -> None:
         if self.mode != "simulation":
             return
-        self.physics_clock.advance(self.sim.step, elapsed, self.time_scale, paused=self.paused)
+        if not self.paused:
+            self.diagnostic_points = []
+            self.sim.begin_device_frame()
+        try:
+            self.physics_clock.advance(self.sim.step, elapsed, self.time_scale, paused=self.paused)
+        finally:
+            self.sim.end_device_frame()
         self.effective_time_scale = self.physics_clock.effective_speed
 
         self.ensure_trails()
@@ -504,6 +543,24 @@ class GravityApp:
         elif self.show_glow:
             self.galaxy_lighting.draw_bulge(self.screen,self.world_to_screen(0,0),self.zoom)
 
+        if self.show_tree:
+            from diagnostics import tree_boxes
+            for x0, y0, x1, y1, depth in tree_boxes(self.sim):
+                a, b = self.world_to_screen(x0, y0), self.world_to_screen(x1, y1)
+                pygame.draw.rect(self.screen, (35+depth*20, 75, 120),
+                                 pygame.Rect(a[0], a[1], max(1, b[0]-a[0]), max(1, b[1]-a[1])), 1)
+        for x, y, ax, ay, error in self.diagnostic_points:
+            start = self.world_to_screen(x, y)
+            norm = math.hypot(ax, ay)
+            if norm:
+                end = (start[0]+24*ax/norm, start[1]+24*ay/norm)
+                color = (90, 230, 150) if error < .01 else ((255, 190, 80) if error < .05 else (255, 80, 80))
+                pygame.draw.line(self.screen, color, start, end, 2)
+                angle = math.atan2(ay, ax)
+                for delta in (-.5, .5):
+                    tip = (end[0]-6*math.cos(angle+delta), end[1]-6*math.sin(angle+delta))
+                    pygame.draw.line(self.screen, color, end, tip, 2)
+
         if self.show_trails:
             for i, body in enumerate(self.sim.bodies):
                 points = self.transformed_trail_points(i)
@@ -520,7 +577,7 @@ class GravityApp:
                 pygame.draw.circle(self.screen, LOCK_COLOR, (sx, sy), radius + 5, 2)
 
         status = "PAUSED" if self.paused else "RUNNING"
-        solver = {"fmm": "FMM", "barnes-hut": "Barnes-Hut", "exact": "Exact"}[self.sim.active_solver]
+        solver = {"fmm": "FMM", "barnes-hut": "Barnes-Hut", "exact": "Exact", "cuda-exact": "CUDA exact FP32"}[self.sim.active_solver]
         if self.sim.solver == "auto":
             solver += " (auto)"
         ref_name = self.reference_body.name if self.reference_index() is not None else "World"
@@ -529,6 +586,7 @@ class GravityApp:
             f"speed={self.effective_time_scale:.1f}x/{self.time_scale:g}x   zoom={self.zoom:.2f}x   frame={ref_name}"
         )
         self.screen.blit(self.font.render(header, True, TEXT), (16, 14))
+        self.screen.blit(self.small_font.render(f"{self.clock.get_fps():.0f} FPS | {self.diagnostic_text}", True, MUTED), (16, self.screen.get_height()-26))
 
         spawn_text = (
             f"New body: radius={self.spawn_radius:.0f}  mass={self.spawn_mass:.2f}  "
@@ -599,10 +657,21 @@ class GravityApp:
 
 def main() -> int:
     try:
-        GravityApp().run()
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--solver", choices=("fmm", "exact", "barnes-hut", "auto", "cuda-exact"), default="fmm")
+        parser.add_argument("--galaxy-particles", type=int, default=1200)
+        args = parser.parse_args()
+        if args.galaxy_particles < 2:
+            parser.error("--galaxy-particles must be at least 2")
+        if args.solver == "cuda-exact":
+            from cuda_gravity import cuda_available, verify_device
+            if not cuda_available():
+                raise RuntimeError("CUDA requested but no NVIDIA CUDA device is available")
+            print(f"CUDA startup checks passed: {verify_device()}")
+        GravityApp(args.solver, args.galaxy_particles).run()
         return 0
-    except pygame.error as exc:
-        print(f"Pygame could not start: {exc}", file=sys.stderr)
+    except (pygame.error, ImportError, RuntimeError) as exc:
+        print(f"Simulator could not start: {exc}", file=sys.stderr)
         return 1
 
 
