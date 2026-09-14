@@ -2,6 +2,49 @@
 
 A cross-platform Newtonian **N-body gravity simulator** written in Python with a Pygame interface.
 
+
+## NVIDIA CUDA quick start (this fork)
+
+After pulling this fork, run **`run_windows_cuda.bat`**. It creates/uses `.venv`,
+installs the pinned CUDA-capable NVIDIA Warp wheel, checks actual GPU forces and
+integration, then opens the simulator. Choose **4 / Spiral Galaxy** for **5,000
+stars**. Your current NVIDIA driver is used; no separate CUDA Toolkit, compiler,
+WSL, or PyTorch installation is required. First launch compiles kernels and takes
+longer. CPU solvers remain available through S/B.
+
+```powershell
+.\run_windows_cuda.bat
+# Optional larger galaxy:
+.\run_windows_cuda.bat --galaxy-particles 10000
+```
+
+This adds **CUDA exact**, not CUDA FMM. The NVIDIA tiled implementation evaluates
+all pairs without allocating an N-by-N matrix. Its FP32 velocity-Verlet state
+stays on the GPU between physics steps; the existing Pygame renderer receives
+one snapshot per frame. The original CPU FMM and ordinary launcher retain their
+default behavior. Actual GPU speed depends on hardware and is not yet measured
+in this repository; the startup accuracy check runs on your GPU.
+
+New controls: **U** enables CUDA exact; **H** shows the spatial hierarchy;
+**A** pauses and displays sampled force-error arrows. FPS is shown in the HUD.
+The hierarchy view is diagnostic and can reduce rendering performance.
+
+See [the source comparison and validation details](docs/gpu-solver-review.md).
+To benchmark 1,200 / 5,000 / 10,000 particles after installation:
+
+```powershell
+.venv\Scripts\python.exe benchmarks\benchmark_cuda.py --compare-cpu --output benchmarks\results\cuda-local.json
+```
+
+Optional PyTorch users can call `torch_gravity.accelerations(positions, masses)`
+with CPU or CUDA tensors for a blocked exact reference, or use
+`DeviceState.torch_views()` for zero-copy access to the Warp state. PyTorch is
+not a dependency of the fast interactive path. Do not install a CPU Torch build
+expecting it to execute CUDA tensor operations; install your desired supported
+CUDA build from [PyTorch](https://pytorch.org/get-started/locally/) separately if
+using that optional API. Framework stream synchronization is documented in the
+method docstring.
+
 ## Features
 
 - Newtonian gravity in 2D
