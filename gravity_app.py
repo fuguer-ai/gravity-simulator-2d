@@ -196,9 +196,8 @@ class GravityApp:
         self.title_font = pygame.font.SysFont("consolas", 23, bold=True)
 
         self.galaxy_particles = galaxy_particles
-        self.show_tree = False
         self.diagnostic_points = []
-        self.diagnostic_text = "H: spatial tree   A: pause + force error   U: CUDA exact"
+        self.diagnostic_text = "A: pause + force error   U: CUDA exact"
         self.galaxy_lighting = GalaxyLighting()
         self.show_glow = True
         self.physics_clock = FixedStepClock()
@@ -264,7 +263,7 @@ class GravityApp:
                                    background=GALAXY_BACKGROUND if key == "galaxy" else None)
         self.sim.cuda_enabled = cuda_enabled
         self.diagnostic_points = []
-        self.diagnostic_text = "H: spatial tree   A: pause + force error   U: CUDA exact"
+        self.diagnostic_text = "A: pause + force error   U: CUDA exact"
         self.trail_maxlen = 120 if key == "galaxy" else 600
         self.trails = []
         self.ensure_trails()
@@ -402,14 +401,22 @@ class GravityApp:
             elif event.key == pygame.K_F1:
                 self.show_hud = not self.show_hud
             elif event.key == pygame.K_v and self.renderer:
-                self.renderer.mode = "density" if self.renderer.mode == "cinematic" else "cinematic"
+                modes = ("cinematic", "density", "hybrid")
+                self.renderer.mode = modes[(modes.index(self.renderer.mode)+1)%len(modes)]
+            elif event.key == pygame.K_j and self.renderer:
+                self.renderer.jelly = not self.renderer.jelly
+            elif event.key == pygame.K_k and self.renderer:
+                sizes = (1., 1.5, 2., 3.)
+                self.renderer.star_scale = sizes[(sizes.index(self.renderer.star_scale)+1)%len(sizes)]
+            elif event.key == pygame.K_n and self.renderer:
+                self.renderer.mist = not self.renderer.mist
+            elif event.key == pygame.K_l and self.renderer:
+                self.renderer.flares = not self.renderer.flares
             elif event.key in (pygame.K_COMMA, pygame.K_PERIOD) and self.renderer:
                 factor = 1.2 if event.key == pygame.K_PERIOD else 1/1.2
                 self.renderer.exposure = min(8., max(.15, self.renderer.exposure*factor))
             elif event.key == pygame.K_SPACE:
                 self.paused = not self.paused
-            elif event.key == pygame.K_h:
-                self.show_tree = not self.show_tree
             elif event.key == pygame.K_a:
                 from diagnostics import force_sample
                 self.paused = True
@@ -435,7 +442,7 @@ class GravityApp:
             elif event.key in (pygame.K_s, pygame.K_b):
                 self.sim.cycle_solver()
                 self.diagnostic_points = []
-                self.diagnostic_text = "H: spatial tree   A: pause + force error   U: CUDA exact"
+                self.diagnostic_text = "A: pause + force error   U: CUDA exact"
             elif event.key == pygame.K_PAGEUP:
                 self.physics_clock.adjust_timestep(1)
             elif event.key == pygame.K_PAGEDOWN:
@@ -680,12 +687,6 @@ class GravityApp:
         elif self.show_glow and self.renderer is None:
             self.galaxy_lighting.draw_bulge(self.screen,self.world_to_screen(0,0),self.zoom)
 
-        if self.show_tree:
-            from diagnostics import tree_boxes
-            for x0, y0, x1, y1, depth in tree_boxes(self.sim):
-                a, b = self.world_to_screen(x0, y0), self.world_to_screen(x1, y1)
-                pygame.draw.rect(self.screen, (35+depth*20, 75, 120),
-                                 pygame.Rect(a[0], a[1], max(1, b[0]-a[0]), max(1, b[1]-a[1])), 1)
         for x, y, ax, ay, error in self.diagnostic_points:
             start = self.world_to_screen(x, y)
             norm = math.hypot(ax, ay)
@@ -743,19 +744,23 @@ class GravityApp:
             text(f"batch {a.batch_size} / {a.batch_ms:.2f} ms   copy {a.transfer_ms:.2f} ms", (max(24,w-345),78 if w>=900 else 151))
         if self.renderer and self.renderer.mode=="density":
             text("MASS DENSITY  /  LOG SCALE  /  BLUE → GOLD", (30,124 if w>=900 else 177), (217,173,235))
+        if self.renderer and self.renderer.mode!="density":
+            r=self.renderer
+            text(f"{r.mode.upper()} / {'JELLY' if r.jelly else 'STARS'} {r.star_scale:g}x / HAZE {'ON' if r.mist else 'OFF'} / FLARE {'ON' if r.flares else 'OFF'}", (30,124 if w>=900 else 177), (217,173,235))
         if self.reference_body:
             text(f"FRAME / {self.reference_body.name}", (30,146), LOCK_COLOR)
         elif self.reference_pick_armed:
             text("Click a particle to follow it", (30,146), LOCK_COLOR)
-        text("TAB help   F1 clean view   V density   T trails   SPACE pause", (24,h-52))
+        text("TAB help   F1 clean view   V view   J jelly   K size   T trails   SPACE pause", (24,h-52))
         text(self.diagnostic_text, (24,h-29), (113,135,165))
         if self.show_help:
             lines=[
                 "CONTROLS",
                 "+/- speed | PgUp/PgDn timestep | 0 reset timestep",
                 "S/B solver | U enable CUDA | G glow | T trails",
-                "V cinematic/density | comma/period exposure",
-                "H spatial tree | A pause + sample force errors",
+                "V cinematic/density/hybrid | comma/period exposure",
+                "J jelly stars | K star size | N nebula haze | L flares",
+                "A pause + sample force errors",
                 "Wheel zoom | middle-drag pan | F follow particle",
                 "Left add | right remove | C color | [ ] body size",
                 f"New body: mass {self.spawn_mass:.2f}, radius {self.spawn_radius:g}",

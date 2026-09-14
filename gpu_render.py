@@ -24,12 +24,14 @@ uniform vec2 viewport;
 uniform vec2 origin;
 uniform float zoom;
 uniform float splat_radius;
+uniform float star_scale;
+uniform int jelly;
 uniform int density;
 out vec2 local;
 out vec3 tint;
 out float weight;
 void main(){
-    float r = density==1 ? splat_radius : clamp((5.+radius*3.)*sqrt(zoom),3.,45.);
+    float r = density==1 ? splat_radius : clamp((5.+radius*3.)*sqrt(zoom)*star_scale*(jelly==1 ? 1.8 : 1.),3.,90.);
     vec2 pixel=(position-origin)*zoom+viewport*.5+corner*r;
     gl_Position=vec4(pixel.x/viewport.x*2.-1., 1.-pixel.y/viewport.y*2.,0,1);
     local=corner; tint=color; weight=mass;
@@ -41,6 +43,7 @@ in vec3 tint;
 in float weight;
 uniform int density;
 uniform int glow;
+uniform int jelly;
 out vec4 frag;
 void main(){
     float r2=dot(local,local);
@@ -50,7 +53,16 @@ void main(){
     } else {
         float core=exp(-150.*r2);
         float halo=glow==1 ? .17*exp(-7.*r2) : 0.;
-        frag=vec4(tint*(core*1.6+halo),1.);
+        if(jelly==1){
+            // Additive translucent sphere impostor: soft interior, iridescent rim,
+            // and an off-centre specular highlight. No sorting or extra geometry.
+            float r=sqrt(r2);
+            float edge=1.-smoothstep(.84,1.,r);
+            float rim=exp(-pow((r-.68)/.13,2.));
+            float highlight=exp(-90.*dot(local-vec2(-.23,-.27),local-vec2(-.23,-.27)));
+            vec3 pearl=mix(tint,vec3(.48,.72,1.),.35+.25*local.x);
+            frag=vec4((pearl*(.075*sqrt(1.-r2)+.18*rim)+vec3(.8,.9,1.)*highlight*.5+ tint*(core*.35+halo*.4))*edge,1.);
+        } else frag=vec4(tint*(core*1.6+halo),1.);
     }
 }
 '''
@@ -85,6 +97,9 @@ uniform float exposure;
 uniform float bloom_strength;
 uniform int density;
 uniform int galaxy;
+uniform int hybrid;
+uniform int mist;
+uniform int flares;
 uniform vec2 viewport;
 uniform vec2 origin;
 uniform float zoom;
@@ -111,6 +126,29 @@ void main(){
     float d=texture(density_tex,uv).r;
     vec3 unresolved=vec3(.07,.027,.105)*log(1.+d*.20);
     radiance+=bloom_strength*texture(bloom,uv).rgb+bulge+unresolved*bloom_strength;
+    if(hybrid==1){
+        float heat=clamp(log(1.+d*exposure*.35)/3.6,0.,1.);
+        // Same log palette as density mode, combined in HDR before tone mapping.
+        radiance+=palette(heat)*smoothstep(0.,.12,heat)*(.16+heat*1.1);
+    }
+    if(mist==1){
+        vec2 offset=vec2(16.)/viewport;
+        float haze=(texture(density_tex,uv+offset).r+texture(density_tex,uv-offset).r
+                   +texture(density_tex,uv+vec2(offset.x,-offset.y)).r
+                   +texture(density_tex,uv+vec2(-offset.x,offset.y)).r)*.25;
+        float structure=.75+.25*sin(world.x*.013+sin(world.y*.009));
+        radiance+=vec3(.10,.055,.19)*log(1.+haze*.25)*structure;
+    }
+    if(flares==1){
+        // Screen-space anamorphic streaks from bright bloom; six extra taps.
+        vec3 streak=vec3(0.);
+        for(int i=1;i<=3;i++){
+            vec2 offset=vec2(float(i)*12./viewport.x,0.);
+            streak+=(max(texture(bloom,uv+offset).rgb-vec3(.22),vec3(0.))
+                    +max(texture(bloom,uv-offset).rgb-vec3(.22),vec3(0.)))/float(i);
+        }
+        radiance+=streak*vec3(.20,.32,.50)*bloom_strength;
+    }
     color=vec3(.008,.011,.025)+1.-exp(-radiance*exposure);
  }
  float vignette=1.-.28*dot(uv-.5,uv-.5);
@@ -130,7 +168,11 @@ void main(){ frag=texture(overlay,vec2(uv.x,1.-uv.y)); }
 class GalaxyRenderer:
     def __init__(self, context=None):
         self.ctx=context or gl.create_context(require=330)
-        self.mode='cinematic'
+        self.mode='hybrid'
+        self.jelly=False
+        self.star_scale=1.0
+        self.mist=False
+        self.flares=False
         self.exposure=1.5
         self._resources=[]
         self._size=None
@@ -209,7 +251,7 @@ class GalaxyRenderer:
             self.reset_history()
             return
         self.metadata(bodies)
-        camera=(zoom,self.mode,trails,glow)
+        camera=(zoom,self.mode,trails,glow,self.jelly,self.star_scale)
         if camera!=self._camera:
             self.reset_history()
             self._camera=camera
@@ -232,9 +274,11 @@ class GalaxyRenderer:
             self.stars['zoom']=zoom
             self.stars['density']=int(self.mode=='density')
             self.stars['glow']=int(glow)
+            self.stars['jelly']=int(self.jelly)
+            self.stars['star_scale']=self.star_scale
             self.stars['splat_radius']=min(45.,max(10.,math.sqrt(size[0]*size[1]/len(bodies))*1.7))
             self.vao.render(vertices=6,instances=len(bodies))
-            if self.mode=='cinematic':
+            if self.mode!='density':
                 self.density_field[1].use()
                 self.density_field[1].clear()
                 self.stars['density']=1
@@ -244,9 +288,9 @@ class GalaxyRenderer:
             self.density_field[1].clear()
         self.ctx.disable(gl.BLEND)
         active=self.scene
-        if trails and self.mode=='cinematic' and paused and self._history:
+        if trails and self.mode!='density' and paused and self._history:
             active=self.histories[0]
-        elif trails and self.mode=='cinematic':
+        elif trails and self.mode!='density':
             previous,next_=self.histories
             next_[1].use()
             self.scene[0].use(0)
@@ -280,7 +324,8 @@ class GalaxyRenderer:
         self.density_field[0].use(3)
         for name,value in dict(scene=0,bloom=1,overlay=2,density_tex=3,exposure=self.exposure,
                                bloom_strength=.8 if glow else 0.,density=int(self.mode=='density'),
-                               galaxy=int(galaxy and glow),viewport=size,origin=origin,zoom=zoom).items():
+                               galaxy=int(galaxy and glow),hybrid=int(self.mode=='hybrid'),
+                               mist=int(self.mist),flares=int(self.flares),viewport=size,origin=origin,zoom=zoom).items():
             self.composite[name]=value
         self.full[self.composite].render()
 

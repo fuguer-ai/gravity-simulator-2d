@@ -335,3 +335,18 @@ the production solver uses fixed expansion order and `fmm_theta`.
 ## Notes
 
 This is an educational simulator rather than a high-precision astrophysics package. The Solar System preset uses realistic relative masses and orbital-distance ratios, but it is intentionally simplified to 2D circular orbits and uses enlarged display radii.
+### Hybrid clouds and jelly stars
+
+OpenGL now starts in **hybrid** mode: the density palette appears beneath luminous
+particles and bloom. Press **V** to cycle cinematic → density → hybrid.
+**J** toggles translucent-looking pearlescent jelly spheres; **K** cycles visual
+star size (1×, 1.5×, 2×, 3×). **N** toggles nebula haze, **L** toggles anamorphic
+flare streaks. Bloom remains on **G**, trails on **T**, exposure on comma/period.
+These are original screen-space effects using existing render targets; haze is
+not volumetric transport and jelly stars are additive sphere impostors, not
+refractive geometry. Larger stars increase pixel overdraw approximately with
+the square of their visual scale. Physics and physical body sizes are unchanged.
+This quick visual update received a Python syntax check only; GPU visual and
+performance verification is deferred to interactive use.
+
+The spatial-tree display and H shortcut have been removed; internal solver trees remain.
