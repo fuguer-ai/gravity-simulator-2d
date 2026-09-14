@@ -3,47 +3,77 @@
 A cross-platform Newtonian **N-body gravity simulator** written in Python with a Pygame interface.
 
 
-## NVIDIA CUDA quick start (this fork)
+## Observatory: NVIDIA CUDA + OpenGL
 
-After pulling this fork, run **`run_windows_cuda.bat`**. It creates/uses `.venv`,
-installs the pinned CUDA-capable NVIDIA Warp wheel, checks actual GPU forces and
-integration, then opens the simulator. Choose **4 / Spiral Galaxy** for **5,000
-stars**. Your current NVIDIA driver is used; no separate CUDA Toolkit, compiler,
-WSL, or PyTorch installation is required. First launch compiles kernels and takes
-longer. CPU solvers remain available through S/B.
+Run **`run_windows_cuda.bat`** after pulling this fork. It creates/uses `.venv`
+and installs pinned NVIDIA Warp and ModernGL wheels. No separate CUDA Toolkit,
+compiler, WSL, or PyTorch installation is required; use your current NVIDIA driver.
 
 ```powershell
+git switch main
+git pull --ff-only origin main
 .\run_windows_cuda.bat
-# Optional larger galaxy:
-.\run_windows_cuda.bat --galaxy-particles 10000
 ```
 
-This adds **CUDA exact**, not CUDA FMM. The NVIDIA tiled implementation evaluates
-all pairs without allocating an N-by-N matrix. Its FP32 velocity-Verlet state
-stays on the GPU between physics steps; the existing Pygame renderer receives
-one snapshot per frame. The original CPU FMM and ordinary launcher retain their
-default behavior. Actual GPU speed depends on hardware and is not yet measured
-in this repository; the startup accuracy check runs on your GPU.
+Startup checks CUDA forces, Verlet integration, graph replay and timestep
+changes, then **detects your GPU/VRAM and calibrates a starting particle count**.
+Choose **4 / Spiral Galaxy**. Auto selection targets a measured 0.8 ms physics
+step, with VRAM headroom and a 50,000-particle cap. It is a starting point for
+visual density and useful speed, not a maximum supported count or an FPS promise.
+Exact gravity uses O(N) storage but O(N²) work, so free VRAM alone cannot choose N.
 
-New controls: **U** enables CUDA exact; **H** shows the spatial hierarchy;
-**A** pauses and displays sampled force-error arrows. FPS is shown in the HUD.
-The hierarchy view is diagnostic and can reduce rendering performance.
+The default now uses **one coordinated physics-then-render loop**. CUDA state
+persists across frames, short CUDA graph batches replace per-step Python waits,
+and OpenGL draws particle instances, bloom, density and fading trails. The frame
+budget reserves measured render time. An optional worker exists for experiments;
+it is **off by default** because concurrent use of one GPU can worsen pacing.
 
-See [the source comparison and validation details](docs/gpu-solver-review.md).
-To benchmark 1,200 / 5,000 / 10,000 particles after installation:
+To compare directly with your previous 5,000-star run, override auto selection:
 
 ```powershell
-.venv\Scripts\python.exe benchmarks\benchmark_cuda.py --compare-cpu --output benchmarks\results\cuda-local.json
+.\run_windows_cuda.bat --galaxy-particles 5000
 ```
+
+| Control | Effect |
+|---|---|
+| `V` | Cinematic stars / logarithmic relative mass-density map |
+| `T` | Smooth fading trails (screen-space exposure in OpenGL) |
+| `G` | Glow and bloom |
+| `,` / `.` | Lower / raise exposure |
+| `F1` | Hide/show HUD for a clean view |
+| `Tab` | Show/hide full controls |
+| `H` | Spatial quadtree overlay |
+| `A` | Pause and compare sampled forces with direct summation |
+| `U` | Enable CUDA exact; `S` / `B` cycles enabled solvers |
+| `Page Up` / `Page Down` | Larger / smaller timestep; `0` restores default |
+
+The HUD shows achieved/requested simulated speed, steps/second, FPS and batch
+cost. **Keep N and dt fixed when comparing performance.** A larger timestep
+increases simulated-time speed while changing integration accuracy.
+
+Diagnostics (optional, after the launcher installs dependencies):
+
+```powershell
+.venv\Scripts\python.exe benchmarks\benchmark_cuda.py --sizes 5000 --output benchmarks\results\cuda-local.json
+.venv\Scripts\python.exe benchmarks\compare_timesteps.py --output benchmarks\results\timestep-local.json
+```
+
+The first compares the old upload/per-step-barrier frame pattern with persistent
+batches at the same N, dt and eight steps/frame; rendering is excluded. The
+second compares equal simulated durations against a smaller timestep, including
+energy and radial statistics. Neither silently changes your timestep.
+
+Advanced fallbacks: `--no-graphs`, `--renderer software`, or experimental
+`--threaded`. The normal `run_windows.bat` retains CPU FMM and software fallback.
+There is no CUDA FMM in this release. CPU FMM/Barnes-Hut remain available.
 
 Optional PyTorch users can call `torch_gravity.accelerations(positions, masses)`
-with CPU or CUDA tensors for a blocked exact reference, or use
-`DeviceState.torch_views()` for zero-copy access to the Warp state. PyTorch is
-not a dependency of the fast interactive path. Do not install a CPU Torch build
-expecting it to execute CUDA tensor operations; install your desired supported
-CUDA build from [PyTorch](https://pytorch.org/get-started/locally/) separately if
-using that optional API. Framework stream synchronization is documented in the
-method docstring.
+with CPU/CUDA tensors or use `DeviceState.torch_views()` for zero-copy array
+access; observe its documented synchronization rules. Torch is not required by
+the fast application path.
+
+See [implementation and validation](docs/observatory-implementation.md) and
+[the source comparison](docs/gpu-solver-review.md).
 
 ## Features
 
@@ -146,7 +176,7 @@ The visual changes preserve every particle's initial position, velocity, and mas
 | `M` | Return to scenario selection |
 | `Esc` or `Q` | Quit |
 
-The HUD displays the current new-body radius, mass, color, reference frame, and timestep. Steps above 2x the preset default are marked COARSE.
+The compact HUD shows the solver, timestep, speed and reference frame. Tab opens detailed controls and new-body settings. Increasing the timestep trades temporal accuracy for simulated-time speed.
 
 ## Moving reference frames
 
@@ -175,9 +205,8 @@ fixed between explicit changes. Larger steps advance more simulated time per
 force calculation but resolve orbits less accurately. A change clears pending
 time and the speed estimate to avoid catch-up bursts; scenario resets restore
 the default.
-A bounded CPU budget takes additional steps when the machine has time. When it
-cannot keep up, the HUD displays **achieved/requested** speed instead of taking
-automatically enlarging steps. This also prevents a growing catch-up backlog.
+A bounded frame budget takes additional steps when the machine has time. When it
+cannot keep up, the HUD displays **achieved/requested** speed instead of automatically enlarging steps. This also prevents a growing catch-up backlog.
 
 ## Update to the integrated main branch
 

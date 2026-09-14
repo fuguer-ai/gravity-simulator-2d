@@ -73,6 +73,29 @@ class DeviceTests(unittest.TestCase):
             sim.solver_mode = 'cuda-exact'
             sim.step(.001)
 
+    def test_batches_preserve_state_across_frames_and_dt_changes(self):
+        from cuda_gravity import DeviceState
+        from cuda_controller import CudaFrameController
+        bs=bodies(65)
+        reference=NBodySimulation(copy.deepcopy(bs),solver='exact',softening=.5)
+        def factory(*a,**k):
+            k['device']=self.device
+            return DeviceState(*a,**k)
+        controller=CudaFrameController(bs,1.,.5,state_factory=factory)
+        original_state=controller.state
+        for count,dt in ((1,.001),(4,.001),(4,.001),(8,.002),(2,.001)):
+            controller.batch(count,dt)
+            for _ in range(count):reference.step(dt)
+            pos,vel=controller.snapshot()
+            np.testing.assert_allclose(pos,[(b.x,b.y) for b in reference.bodies],rtol=2e-4,atol=2e-5)
+            np.testing.assert_allclose(vel,[(b.vx,b.vy) for b in reference.bodies],rtol=2e-4,atol=2e-5)
+            self.assertIs(controller.state,original_state)
+        self.assertEqual(controller.steps,19)
+        # Snapshots never alias device storage or each other.
+        old=pos.copy()
+        controller.batch(1,.1)
+        np.testing.assert_array_equal(pos,old)
+
     def test_invalid_inputs(self):
         from cuda_gravity import DeviceState
         for eps in (0, -1, float('nan')):

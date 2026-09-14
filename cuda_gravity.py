@@ -205,7 +205,7 @@ class DeviceState:
                 "masses": wp.to_torch(self.mass)[:self.n]}
 
 
-def verify_device(device="cuda:0"):
+def verify_device(device="cuda:0", *, use_graphs=True):
     """Small startup check of unequal masses, a partial tile, force and integration.
 
     Returns device name after comparison to the existing FP64 Python solver.
@@ -231,9 +231,10 @@ def verify_device(device="cuda:0"):
         raise RuntimeError("CUDA integration startup check failed")
     # Exercise graph capture, replay and dt invalidation on actual CUDA devices.
     for dt, count in ((.001, 4), (.001, 4), (.002, 2)):
-        state.step_batch(dt, count)
+        state.step_batch(dt, count, use_graphs=use_graphs)
         for _ in range(count):
             ref.step(dt)
-        if not np.allclose(state.pos.numpy()[:65], [(b.x,b.y) for b in bodies], rtol=5e-5, atol=5e-5):
+        if not (np.allclose(state.pos.numpy()[:65], [(b.x,b.y) for b in bodies], rtol=5e-5, atol=5e-5)
+                and np.allclose(state.vel.numpy()[:65], [(b.vx,b.vy) for b in bodies], rtol=5e-5, atol=5e-5)):
             raise RuntimeError("CUDA batch/graph startup check failed")
     return state.device.name

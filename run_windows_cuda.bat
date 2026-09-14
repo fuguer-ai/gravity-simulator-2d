@@ -7,7 +7,7 @@ if not exist ".venv\Scripts\python.exe" (
 )
 .venv\Scripts\python.exe -m pip install -r requirements-cuda.txt
 if errorlevel 1 goto :error
-.venv\Scripts\python.exe app.py --solver cuda-exact --galaxy-particles 5000 %*
+.venv\Scripts\python.exe app.py --solver cuda-exact --galaxy-particles auto %*
 if errorlevel 1 goto :error
 exit /b 0
 :error

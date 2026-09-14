@@ -26,6 +26,8 @@ class Snapshot:
 class PhysicsWorker:
     def __init__(self, bodies, G, softening, background=None, *, dt=.5, speed=1.,
                  device='cuda:0', use_graphs=True, state_factory=None):
+        if not math.isfinite(dt+speed) or dt <= 0 or speed < 0:
+            raise ValueError("Positive finite dt and nonnegative finite speed required")
         self._bodies = copy.deepcopy(bodies)
         self._args = (G, softening, background)
         self.device, self.use_graphs = device, use_graphs

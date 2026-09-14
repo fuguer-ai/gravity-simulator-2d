@@ -80,6 +80,7 @@ in vec2 uv;
 uniform sampler2D scene;
 uniform sampler2D bloom;
 uniform sampler2D overlay;
+uniform sampler2D density_tex;
 uniform float exposure;
 uniform float bloom_strength;
 uniform int density;
@@ -98,13 +99,18 @@ void main(){
  vec3 radiance=texture(scene,uv).rgb;
  vec3 color;
  if(density==1){
-    float value=1.-exp(-radiance.r*exposure*.3);
-    color=mix(vec3(.009,.013,.033),palette(value),smoothstep(0.,.15,value));
+    float value=clamp(log(1.+radiance.r*exposure*.35)/3.6,0.,1.);
+    color=mix(vec3(.009,.013,.033),palette(value),smoothstep(0.,.08,value));
+    float iso=abs(fract(value*14.+.5)-.5);
+    float line=1.-smoothstep(.015,.045,iso);
+    color+=line*.035*smoothstep(.1,.3,value);
  } else {
     vec2 world=(vec2(uv.x,1.-uv.y)*viewport-viewport*.5)/zoom+origin;
     float r=length(world);
     vec3 bulge=galaxy==1 ? vec3(.28,.16,.20)*pow(1.+r*r/(65.*65.),-2.) : vec3(0.);
-    radiance+=bloom_strength*texture(bloom,uv).rgb+bulge;
+    float d=texture(density_tex,uv).r;
+    vec3 unresolved=vec3(.07,.027,.105)*log(1.+d*.20);
+    radiance+=bloom_strength*texture(bloom,uv).rgb+bulge+unresolved*bloom_strength;
     color=vec3(.008,.011,.025)+1.-exp(-radiance*exposure);
  }
  float vignette=1.-.28*dot(uv-.5,uv-.5);
@@ -160,6 +166,7 @@ class GalaxyRenderer:
             fbo.clear()
             return texture,fbo
         self.scene=target(size)
+        self.density_field=target(size)
         self.histories=[target(size),target(size)]
         self.blurs=[target((max(1,w//2),max(1,h//2))) for _ in range(2)]
         self.hud=self.ctx.texture(size,4,dtype='f1')
@@ -181,7 +188,7 @@ class GalaxyRenderer:
                 self._data[:,2:5]=np.array([b.color for b in bodies],dtype='f4')/255
                 self._data[:,5]=[b.radius for b in bodies]
                 m=np.array([b.mass for b in bodies],dtype='f4')
-                self._data[:,6]=m/max(float(m.mean()),1e-20)
+                self._data[:,6]=m/max(float(m.sum()),1e-20)*5000.
             self.reset_history()
 
     def render(self, surface, bodies, positions, origin, zoom, *, trails=False,
@@ -202,7 +209,7 @@ class GalaxyRenderer:
             self.reset_history()
             return
         self.metadata(bodies)
-        camera=(tuple(origin),zoom,self.mode,trails,glow)
+        camera=(zoom,self.mode,trails,glow)
         if camera!=self._camera:
             self.reset_history()
             self._camera=camera
@@ -227,9 +234,19 @@ class GalaxyRenderer:
             self.stars['glow']=int(glow)
             self.stars['splat_radius']=min(45.,max(10.,math.sqrt(size[0]*size[1]/len(bodies))*1.7))
             self.vao.render(vertices=6,instances=len(bodies))
+            if self.mode=='cinematic':
+                self.density_field[1].use()
+                self.density_field[1].clear()
+                self.stars['density']=1
+                self.stars['splat_radius']=min(55.,max(20.,math.sqrt(size[0]*size[1]/len(bodies))*2.5))
+                self.vao.render(vertices=6,instances=len(bodies))
+        if not len(bodies):
+            self.density_field[1].clear()
         self.ctx.disable(gl.BLEND)
         active=self.scene
-        if trails and self.mode=='cinematic':
+        if trails and self.mode=='cinematic' and paused and self._history:
+            active=self.histories[0]
+        elif trails and self.mode=='cinematic':
             previous,next_=self.histories
             next_[1].use()
             self.scene[0].use(0)
@@ -260,7 +277,8 @@ class GalaxyRenderer:
         active[0].use(0)
         self.blurs[1][0].use(1)
         self.hud.use(2)
-        for name,value in dict(scene=0,bloom=1,overlay=2,exposure=self.exposure,
+        self.density_field[0].use(3)
+        for name,value in dict(scene=0,bloom=1,overlay=2,density_tex=3,exposure=self.exposure,
                                bloom_strength=.8 if glow else 0.,density=int(self.mode=='density'),
                                galaxy=int(galaxy and glow),viewport=size,origin=origin,zoom=zoom).items():
             self.composite[name]=value
